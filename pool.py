@@ -1,96 +1,73 @@
-from pika import exceptions
+# coding: utf-8
+import queue
+import threading
+from multiprocessing import Queue, RLock
 
 
-class ChannelWrapper:
-    def __init__(self, pool, channel):
+class ObjectWrapper:
+    def __init__(self, pool, item):
         self._pool = pool
-        self._channel = channel
-        self.is_valid = True
+        self._item = item
 
     def __enter__(self):
         return self
 
-    def __exit__(self, type, value, traceback):
-        if type is not None and isinstance(value, exceptions.AMQPError):
-            self.is_valid = False
-        self._pool.release(self)
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._item is not None:
+            self._pool.release(self._item)
+            self._item = None
 
     def __getattr__(self, name):
-        return getattr(self._channel, name)
+        return getattr(self._item, name)
 
-
-def _default_create(host, port, username, password, vhost):
-    credentials = pika.PlainCredentials(username, password)
-    conn_params = pika.ConnectionParameters(host, port, vhost, credentials)
-    connection = pika.BlockingConnection(conn_params)
-    return connection
+    def __del__(self):
+        if self._item is not None:
+            self._pool.release(self._item)
+            self._item = None
 
 
 class Pool:
-    def __init__(self, create=None, size=2, wrapper=None):
-        self._create = create or _default_create
-        self._size = size
-        self._wrapper = wrapper or ChannelWrapper
-        self._conn = None
-        self._channels = []
-
-    def _connect(self):
-        self._conn = self._create()
-
-    def _get_channel(self):
-        return self._wrapper(self, self._conn.channel())
+    def __init__(self, create, maxsize=None, queue=None, lock=None):
+        self._create = create
+        self._maxsize = maxsize
+        self._queue = queue or Queue()
+        self._lock = lock or RLock()
+        self._size = 0
 
     def acquire(self):
-        if self._conn is None or not self._conn.is_open:
-            self._connect()
+        with self._lock:
+            block = bool(self._maxsize) and (self._size == self._maxsize)
+            try:
+                item = self._queue.get(block=block)
+            except queue.Empty:
+                item = self._create()
+                self._size += 1
+        return ObjectWrapper(self, item)
 
-        while self._channels:
-            channel = self._channels.pop(0)
-            if channel.is_valid:
-                return channel
-
-        return self._get_channel()
-
-    def release(self, channel):
-        while not len(self._channels) < self._size:
-            self._channels.pop(0)
-        self._channels.append(channel)
-
-    def close(self):
-        self._conn.close()
+    def release(self, item):
+        self._queue.put_nowait(item)
 
 
 def main():
-    import json
-    import pika
-    def create(host, port, username, password, vhost):
-        credentials = pika.PlainCredentials(username, password)
-        conn_params = pika.ConnectionParameters(host, port, vhost, credentials)
-        connection = pika.BlockingConnection(conn_params)
-        return connection
+    def create():
+        print('created')
+        return object()
 
-    from functools import partial
-    real_create = partial(create, 'localhost', 5672, 'agile', 'jd73Hye64bbdb.1', 'test')
-    pool = Pool(create=real_create, size=1)
-    channel = pool.acquire()
+    pool = Pool(create, maxsize=20)
 
-    with channel as ch:
-        ch.basic_publish(
-            body=json.dumps({'type': 'banana', 'color': 'yellow'}),
-            exchange='',
-            routing_key='cliqueue',
-        )
-    s = len(pool._channels)
-    with channel as ch:
-        ch.basic_publish(
-            body=json.dumps({'type': 'banana', 'color': 'yellow'}),
-            exchange='',
-            routing_key='cliqueue',
-        )
-    s = len(pool._channels)
-    pass
+    def func():
+        for _ in range(1000):
+            with pool.acquire():
+                pass
+
+    threads = [threading.Thread(target=func) for _ in range(100)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    print(pool._queue.qsize())
 
 
 if __name__ == '__main__':
     main()
-
